@@ -1073,3 +1073,114 @@ mounts applied, and — separately, from the same debug run — `chrome-devtools
 completing its MCP handshake and reaching real tool-routing logic through gemini's actual spawn
 path, not just in isolation, closing out Section 1.14/6.4's "not yet root-caused" status for that
 server as resolved.
+
+### 6.8 `chrome-devtools-mcp` EACCES: the container's remapped UID has no writable HOME
+
+One more real bug found this way, on a *third* host, after Sections 6.7's fix was already
+confirmed working there for `ai-intake` — `chrome-devtools` still failed, this time with an actual
+captured error (via `debug-live.sh`, Section 6.9) instead of a generic "Connection closed":
+
+```
+EACCES: permission denied, mkdir '/home/<user>/.cache'
+```
+
+Every real `gemini-sandbox -s` run logs a line easy to skim past: `Defaulting to use current user
+UID/GID for supported Linux distribution.` On Linux, gemini remaps the sandbox container to the
+*host's own* UID/GID by default (so files the sandbox writes into the mounted workspace aren't
+owned by a mismatched UID afterward on the host) — and sets `HOME` to match the real host home
+path, so that `$HOME/.gemini` still correctly resolves to the identity-mounted config from Section
+1.4. The problem: that `HOME` directory only exists *inside* the container as an auto-vivified
+parent for that one bind-mount target — Docker creates missing bind-mount parent directories
+`root`-owned — so nothing else under `$HOME` is writable. Chrome's default cache directory is
+`$HOME/.cache`; landing there fails exactly as shown above. `ai-intake-mcp` never hit this because
+it never creates anything under `$HOME`.
+
+Reproduced directly, with no `gemini` involved at all, confirming the mechanism rather than
+guessing at it from the error text alone:
+
+```bash
+# An unrecognized UID (any UID with no /etc/passwd entry in the image) reproduces the shape of it:
+docker run --rm --entrypoint sh --user 5000:5000 gemini-sandbox:latest -c 'echo $HOME'
+# -> / (HOME collapses to filesystem root for a truly unrecognized UID; gemini's real remap
+#    additionally sets HOME explicitly to the host home path, giving the more specific
+#    /home/<user>/.cache in the actual error -- same underlying mechanism, more specific value)
+
+# The actual failure mode -- an auto-vivified bind-mount parent, unwritable by a non-root UID:
+mkdir -p /tmp/home-sim/.gemini
+docker run --rm --entrypoint sh -v /tmp/home-sim/.gemini:/home/node/.gemini gemini-sandbox:latest -c '
+  ls -ld /tmp/home-sim   # root:root, not writable by node
+  mkdir /tmp/home-sim/.cache   # Permission denied -- reproduces the real error exactly
+'
+```
+
+**Fix**: give Chrome an explicit profile directory that does not depend on `HOME` at all, rather
+than trying to make `HOME` itself fully writable (which would mean either not remapping UID/GID —
+gemini's own default, not something to fight — or pre-creating and `chown`-ing every directory
+Chrome might ever want under `HOME`, fragile and Chrome-version-dependent). `/tmp` is confirmed
+writable regardless of UID mapping (sticky bit, mode `1777`) on every Linux system:
+
+```json
+"chrome-devtools": {
+  "command": "/usr/local/share/npm-global/bin/chrome-devtools-mcp",
+  "args": [
+    "--headless",
+    "--executable-path", "/usr/bin/chromium",
+    "--chrome-arg=--no-sandbox",
+    "--chrome-arg=--disable-dev-shm-usage",
+    "--user-data-dir=/tmp/chrome-devtools-mcp-profile"
+  ]
+}
+```
+
+Verified live: re-ran the exact same `debug-live.sh` prompt that produced the `EACCES` — gone
+entirely, replaced by a genuinely different, later-stage error (a Chrome DevTools Protocol
+`Target closed`, not yet investigated — a timing/resource-contention question, not a configuration
+one, since it does not reproduce in isolation via the same direct-`docker run` handshake this
+whole investigation has relied on).
+
+### 6.9 Refactor: settings merge logic moved out of an inline bash string
+
+`install.sh`'s `node -e '...'` settings-merge logic (Section 6.3) broke *twice* from the same
+class of bug while documenting Section 6.8 above: an apostrophe inside an explanatory comment
+closed the outer bash single-quoted string early (bash single quotes cannot be escaped, at all —
+the string simply ends at the first one), spilling the rest of the JS out as literal bash syntax
+and failing with a bash syntax error nowhere near the actual problem. Moved to its own
+`merge-settings.js`, invoked as `node merge-settings.js` with the same environment variables
+passed through — a real `.js` file has no bash quoting to fight at all, and is also just the
+more natural place to add a new MCP server registration going forward, which is the entire point
+of this section's existence: **the definitive place to add a new server to this toolkit is
+`merge-settings.js`**, not a construct inside `install.sh` itself.
+
+### 6.10 `debug-live.sh`, and two bugs in the diagnostic tool itself
+
+Section 6.7's `debug-live.sh` (drives a real, `--debug` `gemini-sandbox -s` session and extracts
+each MCP server's actual stderr — necessary because `debug.sh`'s isolated `docker run` checks,
+while a real and useful first-line test, do not replicate gemini's own process tree or spawn
+mechanism) is what found Section 6.8's real bug. Building it hit two more real bugs worth
+recording, since a diagnostic tool that lies about what happened is worse than no diagnostic tool:
+
+1. **Plain `timeout N cmd` does not guarantee termination.** It sends `SIGTERM` after `N` seconds
+   and then *waits indefinitely* for the process to actually exit — if it (or, specifically here,
+   a docker-run grandchild it spawns, a separate PID not reached by a signal sent to the tracked
+   process) does not respond, `timeout` never returns at all. Fixed with `timeout
+   --kill-after=15`, which forces a real `SIGKILL` if the grace period elapses — plus an
+   unconditional cleanup pass afterward that force-removes any of this toolkit's sandbox
+   containers by name, since even a `SIGKILL` to `gemini` does not guarantee its own `docker run`
+   child dies with it (confirmed: this genuinely left an orphaned, still-running sandbox container
+   after an earlier interrupted test in this same investigation).
+2. **A killed process can produce a completely empty log even after real activity.** Node writes
+   `stdout` *synchronously* when attached to a TTY and *asynchronously* (internally buffered)
+   otherwise — confirmed directly on this machine: `process.stdout.isTTY` is `undefined` when
+   redirected to a file via `> log`, exactly what capturing output for later inspection normally
+   does. A hard-killed process never gets to flush that buffer, so a genuine multi-minute hang (or
+   real activity that simply hadn't hit a flush point yet) can produce a *zero-byte* log — which
+   is indistinguishable, by looking at the log alone, from "nothing happened at all." Fixed by
+   running the whole pipeline through `script -qec '<cmd>' "$LOG"` (`util-linux`'s `script`,
+   widely available on Linux), which allocates a pseudo-TTY so gemini's writes land in the log in
+   real time regardless of how the process ultimately exits.
+
+Neither of these is specific to this toolkit — they apply to any script that wraps a
+`timeout`-bounded subprocess (particularly one that itself spawns Docker containers) and captures
+its output for later inspection. Worth defaulting to `timeout --kill-after=N` and a pty-allocating
+wrapper (`script`, or equivalent) in that kind of script generally, not just after hitting the
+failure mode once.
