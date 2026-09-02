@@ -1,0 +1,51 @@
+#!/usr/bin/env bash
+# Runs `gemini` with the env vars its Docker sandbox needs but that aren't settings.json-
+# configurable (source-verified against the installed gemini-cli bundle): GEMINI_SANDBOX_IMAGE
+# is the only way to point at a custom sandbox image, and SANDBOX_MOUNTS is env-var only.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+ENV_FILE="$REPO_ROOT/.gemini/env"
+if [[ ! -f "$ENV_FILE" ]]; then
+  echo "Missing $ENV_FILE -- copy .gemini/env.example to .gemini/env and fill in AI_INTAKE_MCP_DIR." >&2
+  exit 1
+fi
+set -a
+# shellcheck disable=SC1090
+source "$ENV_FILE"
+set +a
+
+if [[ -z "${AI_INTAKE_MCP_DIR:-}" ]]; then
+  echo "AI_INTAKE_MCP_DIR is not set in $ENV_FILE." >&2
+  exit 1
+fi
+AI_INTAKE_MCP_CONFIG_DIR="$HOME/.config/ai-intake-mcp"
+
+# Render .gemini/settings.json from its template -- a static committed settings.json can't hold a
+# per-developer path (Gemini's mcpServers `args` doesn't support $VAR expansion, only `env` does).
+sed "s#__AI_INTAKE_MCP_DIR__#$AI_INTAKE_MCP_DIR#g" \
+  "$REPO_ROOT/.gemini/settings.json.tmpl" > "$REPO_ROOT/.gemini/settings.json"
+
+export GEMINI_SANDBOX_IMAGE=gemini-sandbox-demo:latest
+
+# docker.sock must be explicit :rw -- SANDBOX_MOUNTS defaults an omitted mode to :ro, which would
+# leave the sandboxed `docker` CLI unable to issue commands over the socket. ai-intake-mcp and its
+# credentials are mounted read-only at their real host paths -- it must run as a plain `node`
+# child process sharing the sandboxed CLI's cwd (see ai-intake-mcp's own Dockerfile comment), so a
+# separately-baked copy inside the image would resolve paths against the wrong filesystem.
+SANDBOX_MOUNTS="/var/run/docker.sock:/var/run/docker.sock:rw,$AI_INTAKE_MCP_DIR:$AI_INTAKE_MCP_DIR:ro,$AI_INTAKE_MCP_CONFIG_DIR:$AI_INTAKE_MCP_CONFIG_DIR:ro"
+
+# SANDBOX_MOUNTS entries must exist on the host or gemini refuses to start (FatalSandboxError:
+# "Missing mount path") -- so this is conditional, not hardcoded. Without it, admin-tier Policy
+# Engine rules at the standard system location are invisible inside the sandbox: it isn't one of
+# gemini's own auto-mounts (workspace, ~/.gemini, tmpdir, ~/.config/gcloud,
+# GOOGLE_APPLICATION_CREDENTIALS) -- see .ai/guides/gemini-docker-sandbox-mcp.md Section 1.13.
+ADMIN_POLICY_DIR="/etc/gemini-cli/policies"
+if [[ -d "$ADMIN_POLICY_DIR" ]]; then
+  SANDBOX_MOUNTS="$SANDBOX_MOUNTS,$ADMIN_POLICY_DIR:$ADMIN_POLICY_DIR:ro"
+fi
+
+export SANDBOX_MOUNTS
+
+exec gemini "$@"

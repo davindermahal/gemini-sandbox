@@ -1,0 +1,20 @@
+{
+  "tools": {
+    "sandbox": "docker"
+  },
+  "mcpServers": {
+    "ai-intake": {
+      "command": "/usr/bin/node",
+      "args": ["__AI_INTAKE_MCP_DIR__/dist/index.js"]
+    },
+    "chrome-devtools": {
+      "command": "chrome-devtools-mcp",
+      "args": [
+        "--headless",
+        "--executable-path", "/usr/bin/chromium",
+        "--chrome-arg=--no-sandbox",
+        "--chrome-arg=--disable-dev-shm-usage"
+      ]
+    }
+  }
+}
