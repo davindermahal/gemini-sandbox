@@ -924,3 +924,29 @@ after the fact:
 `gemini-sandbox-toolkit`'s `install.sh` does both of these, plus a basic prerequisite check
 (`docker`, `node`, `gemini`, and `docker info` actually working) before attempting anything else,
 so a missing dependency fails with one clear line instead of an obscure error three steps in.
+
+A third portability issue surfaced installing on a second host, this time from Docker itself
+rather than gemini-cli: `docker build -f "$TOOLKIT_DIR/sandbox.Dockerfile" "$TOOLKIT_DIR"` (an
+*absolute* `-f` path, pointing at a Dockerfile that genuinely exists inside the context) failed
+on that host with
+
+```
+ERROR: failed to build: failed to solve: failed to read dockerfile: open sandbox.Dockerfile: no such file or directory
+```
+
+— note the error names a *relative* filename despite an absolute path being passed. This is a
+known BuildKit quirk: some BuildKit versions re-resolve `-f` relative to the build context
+internally rather than using the absolute path verbatim, and get it wrong when the file is inside
+the context but was referenced absolutely. It worked fine on the machine this was first built on
+(same Docker Engine version, per `docker version`, but evidently a different BuildKit resolution
+path was hit) — exactly the kind of thing that's invisible until a second host disagrees. Fix:
+don't give BuildKit the chance to re-resolve anything — `cd` into the context directory and pass
+both `-f` and the context as plain relative paths:
+
+```bash
+( cd "$TOOLKIT_DIR" && docker build -f sandbox.Dockerfile -t gemini-sandbox:latest . )
+```
+
+This is strictly safer than the absolute form (works identically wherever the absolute form
+happened to work, and also works where it didn't) — worth doing this way by default in any
+installer script, not just as a fix after hitting it on a second machine.
