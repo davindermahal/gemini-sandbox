@@ -757,7 +757,13 @@ without modification. The only genuinely project-specific things are each projec
 
 This repo keeps its own copies (self-contained, works if you clone just this one repo and read
 nothing else) — but the pattern below, tested and running on this machine at `~/.gemini-sandbox/`,
-generalizes it to every project at once.
+generalizes it to every project at once. It's also published as its own installable repo:
+[davindermahal/gemini-sandbox-toolkit](https://github.com/davindermahal/gemini-sandbox-toolkit) —
+```bash
+git clone https://github.com/davindermahal/gemini-sandbox-toolkit ~/.gemini-sandbox
+cd ~/.gemini-sandbox && ./install.sh
+```
+is the fast path if you just want it installed rather than reading how it works first.
 
 ### 6.1 What moves out of the project, and where it goes
 
@@ -872,3 +878,49 @@ docker run --rm --entrypoint sh \
       | timeout 10 /usr/bin/node "'"$AI_INTAKE_MCP_DIR"'"/dist/index.js
   '
 ```
+
+### 6.6 Installing on a *different* host: two things the installer checks for you
+
+Moving this to a second machine surfaces two problems that don't show up on the machine where you
+first built everything, both worth checking for explicitly in an installer rather than debugging
+after the fact:
+
+1. **The base image tag is version-specific** (Section 1.6) — `us-docker.pkg.dev/gemini-code-dev/
+   gemini-cli/sandbox:0.57.0` matches *this machine's* installed CLI version. A second host on a
+   different `gemini-cli` version needs a different tag. Don't hardcode it — detect it:
+   ```bash
+   GEMINI_CLI_VERSION="$(gemini --version 2>/dev/null | tr -d '[:space:]')"
+   docker build --build-arg GEMINI_CLI_VERSION="$GEMINI_CLI_VERSION" ...
+   ```
+   with the Dockerfile taking it as a build arg *before* `FROM` (the one place `ARG` is allowed to
+   affect `FROM` itself):
+   ```dockerfile
+   ARG GEMINI_CLI_VERSION=0.57.0
+   FROM us-docker.pkg.dev/gemini-code-dev/gemini-cli/sandbox:${GEMINI_CLI_VERSION}
+   ```
+2. **A second host may have its own leftover manual sandbox setup** — Section 1.15's
+   `SANDBOX_FLAGS` finding generalizes: any of `GEMINI_SANDBOX`, `GEMINI_SANDBOX_IMAGE`,
+   `SANDBOX_MOUNTS`, `SANDBOX_FLAGS` could already be exported from an earlier, unrelated attempt
+   at this exact setup (a real case hit while building this: a second host had
+   `GEMINI_SANDBOX_IMAGE=gemini-custom-sandbox:latest` exported from a prior manual attempt).
+   This wrapper always overrides `GEMINI_SANDBOX_IMAGE` for its own invocations regardless (it's a
+   plain `export`, not a merge), so that specific case doesn't break `gemini-sandbox` itself — but
+   plain `gemini` with `GEMINI_SANDBOX` also set from the same rc file would silently run under
+   the *old* stale image instead of this one, and a leftover `SANDBOX_FLAGS` still risks Section
+   1.15's duplicate-mount error. An installer can't reach into the shell that invoked it or rewrite
+   rc files on its own authority, but it *can* check and report:
+   ```bash
+   for var in GEMINI_SANDBOX GEMINI_SANDBOX_IMAGE SANDBOX_MOUNTS SANDBOX_FLAGS; do
+     [[ -n "${!var:-}" ]] && echo "currently exported: $var=${!var}"
+   done
+   for rc in "$HOME/.bashrc" "$HOME/.zshrc" "$HOME/.bash_profile" "$HOME/.profile"; do
+     [[ -f "$rc" ]] && grep -nE "export[[:space:]]+(GEMINI_SANDBOX|GEMINI_SANDBOX_IMAGE|SANDBOX_MOUNTS|SANDBOX_FLAGS)=" "$rc"
+   done
+   ```
+   surfacing both what's live in the current shell and what's sitting in rc files that would apply
+   to *future* shells even if not currently exported — print it, tell the user what to remove,
+   don't touch their rc files automatically.
+
+`gemini-sandbox-toolkit`'s `install.sh` does both of these, plus a basic prerequisite check
+(`docker`, `node`, `gemini`, and `docker info` actually working) before attempting anything else,
+so a missing dependency fails with one clear line instead of an obscure error three steps in.
