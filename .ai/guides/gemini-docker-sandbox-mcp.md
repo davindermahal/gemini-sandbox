@@ -12,6 +12,8 @@ trusting these numbers blindly.
 If you only read one section, read Section 1.4 and Section 1.5 — they are the two failures that
 cost the most time before this was worked out, and neither is obvious from the public docs.
 Adding a new MCP server or a browser/headless-Chrome MCP specifically? Skip straight to Section 5.
+Want one sandbox shared across every project instead of copying these files into each repo? Skip
+straight to Section 6.
 
 ## 1. Root causes, in the order they'll bite you
 
@@ -742,3 +744,131 @@ config/data directory too (separate from its code), the closest thing to a real 
 Linux XDG pattern `ai-intake-mcp` itself follows for this — `~/.config/<server-name>/` for config,
 `~/.local/share/<server-name>/` for data — which at least has the virtue of being predictable
 without needing a project-specific env var at all, since it's always `$HOME`-relative.
+
+## 6. Using one sandbox across multiple projects, instead of copying these files into every repo
+
+Everything in Sections 1-5 is written as if `.gemini/sandbox.Dockerfile`, `bin/gemini-sandbox`,
+and `.gemini/settings.json` belong to *this* project. They don't have to. Nothing about the
+sandbox image or the MCP servers registered in it is actually project-specific — Gemini
+auto-mounts whatever directory you happen to run it from as the workspace (Section 1.4), so the
+same image and the same wrapper work against any project's own `make`/`docker compose` commands
+without modification. The only genuinely project-specific things are each project's own
+`Makefile`/`docker-compose.yml` — which every project needs anyway, sandbox or not.
+
+This repo keeps its own copies (self-contained, works if you clone just this one repo and read
+nothing else) — but the pattern below, tested and running on this machine at `~/.gemini-sandbox/`,
+generalizes it to every project at once.
+
+### 6.1 What moves out of the project, and where it goes
+
+- **The sandbox image** — identical to Section 1.6's Dockerfile (nothing in it references any
+  project), built once, tagged `gemini-sandbox:latest` instead of a per-project name.
+- **`mcpServers` registration** — moves from a per-project, templated `.gemini/settings.json` to
+  your **global** `~/.gemini/settings.json`. Gemini merges global and project-scoped settings, so
+  this isn't a workaround — it's the intended mechanism for exactly this case. A project only
+  needs its own `.gemini/settings.json` if it wants a server *in addition to* the global ones.
+- **The wrapper script** — moves to `~/.local/bin/gemini-sandbox` (or wherever's on your `PATH`),
+  so it's one command usable from any project directory instead of `./bin/gemini-sandbox` inside
+  one repo.
+- **One change from the per-project version**: rather than a project-scoped `.gemini/settings.json`
+  with `"tools": {"sandbox": "docker"}` (Section 1.4's approach, appropriate when it only affects
+  one project), the global wrapper sets `GEMINI_SANDBOX=docker` as an **environment variable**
+  instead. Setting `tools.sandbox` globally would force *every* bare `gemini` invocation on the
+  machine into sandbox mode, including unrelated one-off usage with no Docker running. The env var
+  scopes sandboxing to only the moments you actually ran `gemini-sandbox` — plain `gemini` stays
+  untouched, same as it always was.
+
+### 6.2 The wrapper, generalized
+
+Differences from the per-project version in Section 2: no `.gemini/env`/template rendering (the
+MCP config it would have templated now lives once in the global settings.json instead), and the
+`ai-intake-mcp` mount is conditional on being configured at all — this toolkit should work with
+just the sandbox + `chrome-devtools-mcp` even if you don't use `ai-intake-mcp`:
+
+```bash
+#!/usr/bin/env bash
+set -euo pipefail
+
+TOOLKIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+
+unset SANDBOX_FLAGS   # Section 1.15 -- same reasoning, still applies globally
+
+ENV_FILE="$TOOLKIT_DIR/env"
+[[ -f "$ENV_FILE" ]] && { set -a; source "$ENV_FILE"; set +a; }
+
+export GEMINI_SANDBOX=docker
+export GEMINI_SANDBOX_IMAGE=gemini-sandbox:latest
+
+SANDBOX_MOUNTS="/var/run/docker.sock:/var/run/docker.sock:rw"
+if [[ -n "${AI_INTAKE_MCP_DIR:-}" && -d "$AI_INTAKE_MCP_DIR" ]]; then
+  SANDBOX_MOUNTS="$SANDBOX_MOUNTS,$AI_INTAKE_MCP_DIR:$AI_INTAKE_MCP_DIR:ro"
+  CFG="$HOME/.config/ai-intake-mcp"
+  [[ -d "$CFG" ]] && SANDBOX_MOUNTS="$SANDBOX_MOUNTS,$CFG:$CFG:ro"
+fi
+[[ -d /etc/gemini-cli/policies ]] && SANDBOX_MOUNTS="$SANDBOX_MOUNTS,/etc/gemini-cli/policies:/etc/gemini-cli/policies:ro"
+export SANDBOX_MOUNTS
+
+exec gemini "$@"
+```
+
+### 6.3 Installing it: a merge, not an overwrite
+
+The install step needs to write into `~/.gemini/settings.json` without destroying whatever's
+already there (auth config, IDE settings, other MCP servers) — a plain overwrite would be a real
+regression for anyone with an existing setup. `jq` is a natural fit but isn't guaranteed present;
+`node` is (you can't run `gemini` at all without it), so the merge is safer written in `node -e`:
+
+```bash
+node -e '
+const fs = require("fs");
+const path = process.env.GEMINI_SETTINGS_PATH;
+let settings = fs.existsSync(path) ? JSON.parse(fs.readFileSync(path, "utf8")) : {};
+settings.mcpServers = settings.mcpServers || {};
+settings.mcpServers["chrome-devtools"] = { command: "chrome-devtools-mcp", args: [ /* ... */ ] };
+fs.writeFileSync(path, JSON.stringify(settings, null, 2) + "\n");
+'
+```
+
+Back up the original once (`~/.gemini/settings.json.pre-<toolkit-name>-install`, skip the backup
+if it already exists so re-running the installer doesn't overwrite your *real* pre-install state
+with an already-migrated one), then it's safe to re-run any time the Dockerfile or registrations
+change — idempotent, not a one-shot script.
+
+### 6.4 One caveat worth knowing: `ai-intake`'s command path is sandbox-specific
+
+The global `mcpServers.ai-intake` entry uses `/usr/bin/node` (Section 1.9's NodeSource install,
+absolute path) because that's what's correct *inside* the sandbox image. That same global
+settings.json also applies to plain, unsandboxed `gemini` — where `/usr/bin/node` means whatever
+(if anything) happens to be installed there on the bare host, which has nothing to do with the
+sandbox image and isn't guaranteed to exist or be a compatible version. On the machine this was
+tested on, `/usr/bin/node` coincidentally already existed (an unrelated system package, v18,
+older than `ai-intake-mcp`'s declared `engines.node >=24`) and — worth verifying, not assuming —
+turned out to still work: its native addons (`better-sqlite3`, `keytar`) apparently use N-API
+bindings, which are ABI-stable across Node majors, unlike addons built against V8/NAN directly.
+That's a lucky outcome specific to this server, not a guarantee — don't assume it holds for a
+different MCP server's native dependencies. If `ai-intake-mcp` (or any server registered this way)
+doesn't work under plain unsandboxed `gemini` on a different machine, that's expected and
+consistent with everything above: this toolkit's supported path is through `gemini-sandbox`, not
+bare `gemini`.
+
+### 6.5 Verifying without spending API quota
+
+Same method as Sections 1.14/1.15: run the actual sandbox image directly with the same mounts the
+wrapper computes, and hand each registered MCP server's exact `command`/`args` an `initialize`
+handshake over stdio — no `gemini` invocation, no API quota, and it exercises the *exact* config
+`~/.gemini/settings.json` will hand to the real sandboxed CLI (that file is mounted read-only into
+the same probe container at `/home/node/.gemini/settings.json`, so you can `cat` it there to
+confirm what a real sandboxed session would actually see):
+
+```bash
+docker run --rm --entrypoint sh \
+  -v /var/run/docker.sock:/var/run/docker.sock:rw \
+  -v "$AI_INTAKE_MCP_DIR:$AI_INTAKE_MCP_DIR:ro" \
+  -v "$HOME/.config/ai-intake-mcp:$HOME/.config/ai-intake-mcp:ro" \
+  -v "$HOME/.gemini:/home/node/.gemini:ro" \
+  gemini-sandbox:latest -c '
+    cat /home/node/.gemini/settings.json
+    echo '"'"'{"jsonrpc":"2.0","id":1,"method":"initialize","params":{"protocolVersion":"2024-11-05","capabilities":{},"clientInfo":{"name":"probe","version":"0"}}}'"'"' \
+      | timeout 10 /usr/bin/node "'"$AI_INTAKE_MCP_DIR"'"/dist/index.js
+  '
+```
