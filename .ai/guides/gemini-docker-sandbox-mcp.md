@@ -672,3 +672,44 @@ Notes specific to combining this with the sandbox:
   fields (still supported, but the docs call policy-`deny` the recommended mechanism going
   forward) — global `deny` rules remove the tool from the model's context entirely, which is both
   more secure and cheaper on tokens than the model seeing a tool it's never allowed to call.
+
+### 5.3 Where to install a server with local state — the recommended convention
+
+Section 5.1 step 3 asks "where does its code/config live" as if there's an obvious answer. There
+isn't one, ecosystem-wide — checked directly: the MCP spec itself only defines the client-server
+*protocol* (transport, tools/resources/prompts), not deployment, and the official
+[MCP Registry](https://registry.modelcontextprotocol.io/) is explicitly a metadata/discovery
+layer that points at npm/PyPI/container registries rather than prescribing a filesystem location.
+For a server with no local state, the ecosystem default is to sidestep the question entirely by
+never installing anything persistent — invoke it ephemerally via `npx -y <package>@<pinned
+version>` or `uvx <package>` as the `command`, exactly as this repo does for `chrome-devtools-mcp`
+in `.gemini/sandbox.Dockerfile` (baked into the image at a pinned version, so there's no
+per-session network fetch either).
+
+For a server that **does** have local state — a private/forked server, native dependencies, a
+config file, anything you clone rather than fetch from a registry — clone it wherever you want.
+The actual convention worth adopting isn't a specific directory; it's this: **never hardcode that
+path into a committed file.** Treat it as a per-developer setting, the same way any other
+machine-specific config is handled, not as a repo-wide constant. This repo's own
+`AI_INTAKE_MCP_DIR` (Section 1.12, Phase 3b of the implementation) is the concrete instance of
+this pattern:
+
+1. `.gemini/env.example` (committed) — documents the variable and what it should point at, with a
+   placeholder value.
+2. `.gemini/env` (gitignored) — each developer's real path, e.g.
+   `AI_INTAKE_MCP_DIR=/wherever/they/cloned/it`.
+3. `.gemini/settings.json.tmpl` (committed) — the `mcpServers` entry with a placeholder
+   (`__AI_INTAKE_MCP_DIR__`) instead of a literal path, because a static JSON file can't read env
+   vars in `args` (only `env` values support `$VAR` expansion in Gemini's `mcpServers` schema).
+4. `bin/gemini-sandbox` — sources `.gemini/env`, renders the template with `sed`, and builds
+   `SANDBOX_MOUNTS` from the same variable, so the one value drives both the sandbox mount and the
+   MCP registration.
+
+Applying this to a new server: pick any directory you like for it, add one line to
+`.gemini/env.example` / `.gemini/env` for its path, reference the placeholder in
+`.gemini/settings.json.tmpl`, and extend `bin/gemini-sandbox`'s `SANDBOX_MOUNTS` construction the
+same way — don't invent a second templating mechanism per server. If the server needs its own
+config/data directory too (separate from its code), the closest thing to a real convention is the
+Linux XDG pattern `ai-intake-mcp` itself follows for this — `~/.config/<server-name>/` for config,
+`~/.local/share/<server-name>/` for data — which at least has the virtue of being predictable
+without needing a project-specific env var at all, since it's always `$HOME`-relative.
