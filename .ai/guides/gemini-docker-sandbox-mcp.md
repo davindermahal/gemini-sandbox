@@ -409,7 +409,7 @@ su node -s /bin/sh -c "chromium --headless --disable-gpu --no-sandbox --dump-dom
    the tool try to download/manage its own:
    ```json
    "chrome-devtools": {
-     "command": "chrome-devtools-mcp",
+     "command": "/usr/local/share/npm-global/bin/chrome-devtools-mcp",
      "args": [
        "--headless",
        "--executable-path", "/usr/bin/chromium",
@@ -418,6 +418,18 @@ su node -s /bin/sh -c "chromium --headless --disable-gpu --no-sandbox --dump-dom
      ]
    }
    ```
+   `command` is an absolute path, not the bare `chrome-devtools-mcp` this section originally used
+   — found necessary in the field: a host where `chrome-devtools-mcp` tested healthy when spawned
+   directly (`docker run` + manual stdio handshake, bypassing gemini entirely) still showed it as
+   disconnected through an actual `gemini-sandbox -s` session, meaning the discrepancy is
+   specifically in how gemini's own MCP client spawns the process, not in the image. The exact
+   cause isn't root-caused yet (gemini-cli's own environment sanitization for spawned MCP
+   servers explicitly keeps `PATH` in its allow-list, so a stripped `PATH` was the leading theory
+   but doesn't fully check out from reading the source alone) — using an absolute path removes
+   the dependency on `PATH` resolution regardless of the exact mechanism, at no cost, matching
+   `ai-intake`'s `/usr/bin/node` above. If you hit "Connection closed" for a server registered by
+   bare command name, converting it to an absolute path (`command -v <name>` inside the image
+   finds it) is worth trying even without a full explanation.
 3. Default `/dev/shm` is 64 MB (confirmed: `df -h /dev/shm` inside the sandbox container) —
    Docker's standard default and a well-known source of Chrome renderer crashes under real
    (multi-tab/sustained) workloads. Handled above via `--disable-dev-shm-usage` (Chrome falls back
