@@ -472,6 +472,35 @@ container (via DooD, same mechanism as the target project's own containers in Se
 `--browser-url http://<container-name>:9222` instead of installing Chrome in the sandbox image at
 all. Worth it if you want Chrome's profile/cache to survive across sandbox sessions.
 
+### 1.15 "Duplicate mount point" errors on a different host — check for a stray `SANDBOX_FLAGS`
+
+`SANDBOX_FLAGS` is a *different* env var from `SANDBOX_MOUNTS` (Section 1.3) — raw extra `docker
+run` arguments, prepended before any of gemini's own `--volume` flags (source-verified, same
+sandbox-launch function as everything else in this section). `bin/gemini-sandbox` fully owns
+`SANDBOX_MOUNTS` (built fresh every run, so it can't collide with anything old) but never sets
+`SANDBOX_FLAGS` — so if that variable is already exported in the shell you run it from, e.g. left
+over from an earlier *manual* sandbox setup attempt that included its own
+`-v /var/run/docker.sock:/var/run/docker.sock`, it silently combines with `bin/gemini-sandbox`'s
+own docker.sock mount and Docker refuses to start the container:
+
+```
+docker: Error response from daemon: Duplicate mount point: /var/run/docker.sock.
+```
+
+Two things worth knowing, one immediate and one general:
+
+- **Immediate fix**: `unset SANDBOX_FLAGS`, or open a fresh shell. Editing `.bashrc` to remove an
+  old `export SANDBOX_FLAGS=...` line and re-sourcing it does **not** clear that variable from a
+  shell where it's already exported — `source` only re-runs the script against the *existing*
+  environment, it doesn't reset it first. Confirm what's actually exported with
+  `env | grep -i sandbox` before assuming an edited rc file took effect.
+- **General lesson**: any wrapper script that constructs `SANDBOX_MOUNTS` (or otherwise assumes it
+  fully controls the sandbox's docker invocation) should defensively `unset SANDBOX_FLAGS` at the
+  top rather than trust the caller's shell is clean — `bin/gemini-sandbox` does this now. A script
+  that only *sets* the variables it cares about, without clearing the ones it doesn't, is only
+  reproducible in a shell with no history — which is not a safe assumption across machines or even
+  across your own terminal sessions over time.
+
 ## 2. How to re-verify any of this yourself, on a different machine or version
 
 Don't trust the version numbers and exact snippets above once they're more than a few months old,

@@ -6,6 +6,17 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
+# This script owns SANDBOX_MOUNTS entirely (built from scratch below), but SANDBOX_FLAGS is a
+# *different* env var gemini-cli also reads (raw `docker run` flags, prepended before our own
+# --volume args) that this script never sets -- so a stray SANDBOX_FLAGS already exported in your
+# shell (e.g. left over from an earlier manual sandbox setup, with its own `-v
+# /var/run/docker.sock:/var/run/docker.sock`) would silently combine with the docker.sock mount
+# below and fail with Docker's "Duplicate mount point" error. Note that editing .bashrc to remove
+# an old `export SANDBOX_FLAGS=...` and re-sourcing it does NOT unset an already-exported variable
+# in your current shell -- only `unset` or a fresh shell does. Unset here so this script's
+# behavior never depends on what happens to be lingering in the caller's environment.
+unset SANDBOX_FLAGS
+
 ENV_FILE="$REPO_ROOT/.gemini/env"
 if [[ ! -f "$ENV_FILE" ]]; then
   echo "Missing $ENV_FILE -- copy .gemini/env.example to .gemini/env and fill in AI_INTAKE_MCP_DIR." >&2
