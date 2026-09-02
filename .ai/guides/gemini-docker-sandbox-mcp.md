@@ -471,13 +471,11 @@ carries clean JSON-RPC (checked separately, `1>out.log 2>err.log`) — worth con
 MCP server, since anything an MCP server prints to stdout that isn't valid JSON-RPC breaks the
 stdio transport.
 
-**Not yet verified**: a full run *through* `gemini` itself asking it to drive
-`chrome-devtools`'s tools end-to-end — blocked by the same exhausted daily free-tier API quota
-from Section 1.11, which held throughout this session. Everything above establishes the server is
-correctly installed, launchable, and MCP-protocol-correct inside the exact image `gemini` uses;
-the remaining gap is Gemini's own tool-call routing to it, which should work by the same
-established mechanism as `ai-intake` (Section 1.1) but hasn't been watched happen live. Re-run
-once quota resets: `bin/gemini-sandbox -s -p "use chrome-devtools to take a screenshot of https://example.com"`.
+**Verified**, in a later session once API quota was available again: a real `gemini -s -d` run
+showed `chrome-devtools` registering its notification handlers and reaching real tool-routing
+logic for an actual request — genuinely connected through gemini's own spawn path, not just
+launchable in isolation. See Section 6.7 for the full path that got there, including a real bug
+in the toolkit's install script that looked like an MCP problem but wasn't one.
 
 **Alternative deployment shape**, not implemented here: instead of launching Chrome inside the
 (ephemeral, rebuilt-per-image-change) sandbox container, run Chrome as its own long-lived sibling
@@ -992,3 +990,86 @@ basis, and produces the identical image (verified: same layer cache hits, same f
 digest, on the machine where the old form already worked). Only applicable when the Dockerfile
 has no `COPY`/`ADD` — one that does still needs a real build context, and would need the
 version-specific behavior above actually pinned down rather than sidestepped.
+
+### 6.7 A verification method that isn't equivalent to the real thing — and the actual bug it hid
+
+Section 6.5's diagnostic (`debug.sh`: launch each MCP server directly via `docker run`, hand it a
+raw MCP `initialize` handshake over stdio) is a genuinely useful check — it proves the image,
+binaries, and mounts are correct. It is **not** proof that `gemini` itself can reach those
+servers, and treating it as equivalent cost real time here. Worth being explicit about exactly
+what's different, since "I tested it and it works" is only as strong as what was actually tested:
+
+- `debug.sh` runs the MCP server as the container's **own main process** (`--entrypoint sh -c
+  '<mcp command>'`). In the real flow, gemini-cli re-execs its entire self inside the sandbox
+  (Section 1.1) and then spawns each MCP server as **its own child process** via Node's
+  `child_process.spawn` — a different process tree, different signal handling, different
+  environment construction (gemini's own `sanitizeEnvironment` step, Section 1.13's Policy Engine
+  work already established `PATH` is explicitly protected there, but that's one variable among
+  several gemini's spawn path touches and `debug.sh`'s doesn't).
+- `debug.sh` uses Docker's default bridge network. gemini's own sandbox launch creates and joins
+  a dedicated `gemini-cli-sandbox` network. **Tested directly** (`docker network create
+  gemini-cli-sandbox`, then re-ran both servers' handshakes with `--network gemini-cli-sandbox`)
+  — both still succeeded, ruling this out as a factor for stdio-transport MCP specifically (it's
+  local IPC, not networked, so this was always a secondary theory).
+
+Followed the actual failure through gemini's own source (`main()`, before the sandbox-hop
+decision) to find one more previously-undocumented fact: **gemini does an auth-validation and
+initial API round-trip on the host, before deciding whether to sandbox at all** — visible in
+`chunk-DFPYJMVX.js` bundled with the CLI, `main()`'s `validateAuthMethod`/`refreshAuth` calls,
+which happen before the `if (!process.env["SANDBOX"] ...) { ... start_sandbox ... }` block later
+in the same function. In a live run, this produced `Attempt 1 failed with status 503`/`fetch
+failed sending request` retries with real backoff delays, *before* the `hopping into sandbox`
+line ever printed — noisy, and easy to misread as an MCP problem, but unrelated to it: this is
+just Gemini API reachability from the host, checked before the process re-execs into the
+container. Once inside the sandbox (`process.env.SANDBOX` now set), the whole `main()` runs again
+from scratch and does its real work, including the actual MCP connections — the first pass's `MCP
+issues detected` diagnostic (Section 5, `emitDiagnostic`, triggered by any spawn error) can fire
+on this host-side pre-check too if a registered command only exists inside the sandbox image
+(expected — the host obviously doesn't have `/usr/bin/node` or the sandbox's baked-in
+`chrome-devtools-mcp`), and is not itself evidence of a real, final-session failure.
+
+**The actual root cause**, found only by running `gemini -s -d` (`--debug`) for real and reading
+its per-server MCP stderr output (`[DEBUG] [MCP STDERR (ai-intake)]: ... Error: Cannot find
+module '/path/to/ai-intake-mcp/dist/index.js'`) — a concrete, unambiguous error, not a generic
+"Connection closed" wrapper, and worth reaching for directly instead of re-testing the image in
+isolation again: the bind mount for `ai-intake-mcp` was never actually being applied, even though
+`bin/gemini-sandbox`'s own logic for building it was correct and had been checked repeatedly.
+`install.sh` installs the wrapper as a **symlink** at `~/.local/bin/gemini-sandbox`
+(`ln -sf "$TOOLKIT_DIR/bin/gemini-sandbox" "$BIN_DIR/gemini-sandbox"`), and the wrapper computed
+its own directory as:
+
+```bash
+TOOLKIT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+```
+
+`${BASH_SOURCE[0]}` reports the path **as invoked** — when found via `PATH` as plain
+`gemini-sandbox` (the only way it's actually used day to day), that's the symlink's own path
+(`~/.local/bin/gemini-sandbox`), not the real file it points to. `TOOLKIT_DIR` silently resolved
+to `~/.local` (the symlink's parent's parent) instead of `~/.gemini-sandbox`; `~/.local/env` does
+not exist; `AI_INTAKE_MCP_DIR` was never set; the mount was never added to `SANDBOX_MOUNTS` —
+confirmed directly: `bash -x` through the installed symlink showed exactly one `SANDBOX_MOUNTS=`
+entry (just `docker.sock`) where three were expected, and a live sandboxed session's own
+`SANDBOX_MOUNTS:` log lines (gemini logs each mount it applies) showed the same single entry.
+
+This is precisely why it went undetected through extensive manual testing: **every** test up to
+this point invoked the script by its real path directly — `~/.gemini-sandbox/bin/gemini-sandbox`,
+`bash -x` against that same real path, or `./install.sh`/`./debug.sh` run from inside the cloned
+repo. None of those go through the symlink, so `${BASH_SOURCE[0]}` was correct every time except
+in actual real-world use. The general lesson: **verify a script the way it's actually invoked**,
+not the way that's most convenient to test — `~/.gemini-sandbox/bin/gemini-sandbox` and
+`gemini-sandbox` (via `PATH`) are not the same test once symlinks are involved, and a script that
+computes its own location needs `readlink -f` (or equivalent) resolved *before* `dirname`, not
+after, if it might ever be invoked through one:
+
+```bash
+TOOLKIT_DIR="$(cd "$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")/.." && pwd)"
+```
+
+Fixed in all three scripts (`bin/gemini-sandbox`, `install.sh`, `debug.sh`) even though only the
+wrapper is ever actually symlinked today, so this class of bug can't resurface if that changes.
+Confirmed fixed two ways: statically (`bash -x` through the installed symlink now shows all three
+`SANDBOX_MOUNTS` entries) and live (a real `gemini-sandbox -s -d` run's own logs showed all three
+mounts applied, and — separately, from the same debug run — `chrome-devtools-mcp` genuinely
+completing its MCP handshake and reaching real tool-routing logic through gemini's actual spawn
+path, not just in isolation, closing out Section 1.14/6.4's "not yet root-caused" status for that
+server as resolved.
