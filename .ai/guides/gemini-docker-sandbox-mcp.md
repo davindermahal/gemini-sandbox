@@ -926,27 +926,57 @@ after the fact:
 so a missing dependency fails with one clear line instead of an obscure error three steps in.
 
 A third portability issue surfaced installing on a second host, this time from Docker itself
-rather than gemini-cli: `docker build -f "$TOOLKIT_DIR/sandbox.Dockerfile" "$TOOLKIT_DIR"` (an
-*absolute* `-f` path, pointing at a Dockerfile that genuinely exists inside the context) failed
-on that host with
+rather than gemini-cli — and took two attempts to actually fix, not one. Worth walking through
+both, including the failed one, since the failed attempt is exactly the kind of plausible-looking
+fix that's worth being skeptical of until it's actually re-tested.
+
+**The symptom**: `docker build -f "$TOOLKIT_DIR/sandbox.Dockerfile" "$TOOLKIT_DIR"` (an *absolute*
+`-f` path, pointing at a Dockerfile that genuinely exists inside the context) failed on a second
+host with:
 
 ```
 ERROR: failed to build: failed to solve: failed to read dockerfile: open sandbox.Dockerfile: no such file or directory
 ```
 
-— note the error names a *relative* filename despite an absolute path being passed. This is a
-known BuildKit quirk: some BuildKit versions re-resolve `-f` relative to the build context
-internally rather than using the absolute path verbatim, and get it wrong when the file is inside
-the context but was referenced absolutely. It worked fine on the machine this was first built on
-(same Docker Engine version, per `docker version`, but evidently a different BuildKit resolution
-path was hit) — exactly the kind of thing that's invisible until a second host disagrees. Fix:
-don't give BuildKit the chance to re-resolve anything — `cd` into the context directory and pass
-both `-f` and the context as plain relative paths:
+— note the error names a *relative* filename despite an absolute path being passed. It worked
+fine on the machine this was first built on.
+
+**First attempt (wrong)**: the working theory was that BuildKit re-resolves `-f` relative to the
+build context internally and mishandles the absolute form on some versions — so the fix was to
+`cd` into the context directory and pass both `-f` and the context as plain relative paths:
+`( cd "$TOOLKIT_DIR" && docker build -f sandbox.Dockerfile -t gemini-sandbox:latest . )`. This
+looked right, was pushed, and **failed identically on the second host** — same error, verified
+the fix had actually been pulled (checked the pushed commit content directly, not just assumed).
+The lesson: a plausible-sounding root cause that produces a sensible-looking fix is still a
+hypothesis until it's re-tested against the actual failure, not a diagnosis.
+
+**Real diagnosis**: rather than guess a third time, the installer was changed to print hard
+evidence right before the build — resolved context path, a full directory listing of it, the
+active `docker context`, the active `buildx` builder, and (`set -x`) the literal command about to
+run. Re-run on the second host, that evidence ruled out every remaining theory at once: the
+context path was correct, the file was confirmed present (4468 bytes, readable) in exactly that
+directory, environment was clean, docker context and buildx builder were both `default` — and it
+*still* failed with the identical error. The one remaining real difference was the BuildKit
+version itself: `docker buildx version`/`docker buildx inspect` showed different versions between
+the two hosts (confirmed via `docker buildx inspect` output — check yours the same way, it prints
+`BuildKit version:`). That's consistent with a version-specific bug in BuildKit's handling of `-f`
+against a local directory context, not anything about the path form, the environment, or this
+script.
+
+**Actual fix**: stop giving BuildKit's context-relative dockerfile resolution anything to get
+wrong, rather than trying to satisfy it. `sandbox.Dockerfile` has no `COPY`/`ADD` — check with
+`grep -c '^COPY\|^ADD' sandbox.Dockerfile` before relying on this for a *different* Dockerfile —
+so it never needs a separate build context at all. Pipe it in via stdin instead of `-f <path>
+<context-dir>`:
 
 ```bash
-( cd "$TOOLKIT_DIR" && docker build -f sandbox.Dockerfile -t gemini-sandbox:latest . )
+docker build --build-arg DOCKER_GID="$DOCKER_GID" --build-arg GEMINI_CLI_VERSION="$GEMINI_CLI_VERSION" \
+  -t gemini-sandbox:latest \
+  - < "$TOOLKIT_DIR/sandbox.Dockerfile"
 ```
 
-This is strictly safer than the absolute form (works identically wherever the absolute form
-happened to work, and also works where it didn't) — worth doing this way by default in any
-installer script, not just as a fix after hitting it on a second machine.
+This removes the problematic code path entirely rather than working around it on a per-version
+basis, and produces the identical image (verified: same layer cache hits, same final image
+digest, on the machine where the old form already worked). Only applicable when the Dockerfile
+has no `COPY`/`ADD` — one that does still needs a real build context, and would need the
+version-specific behavior above actually pinned down rather than sidestepped.
